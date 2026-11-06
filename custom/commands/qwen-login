@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+qwen-login <account-name>
+
+Starts a Qwen Code OAuth device flow. Returns the verification URL immediately
+(for Discord). A background poller completes the flow once the user authorizes.
+"""
+
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+STATUS_DIR = Path.home() / ".ccx-login"
+ACCOUNTS_FILE = Path.home() / ".codex-switcher" / "accounts.json"
+QWEN_CREDS_FILE = Path.home() / ".qwen" / "oauth_creds.json"
+
+CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
+DEVICE_CODE_URL = "https://chat.qwen.ai/api/v1/oauth2/device/code"
+TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
+SCOPE = "openid profile email model.completion"
+POLL_INTERVAL = 5
+POLL_TIMEOUT = 600  # 10 minutes
+
+
+def pkce_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode()).digest()
+    import base64
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def write_status(name: str, data: dict):
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATUS_DIR / f"{name}.status"
+    path.write_text(json.dumps(data))
+
+
+def request_device_code(verifier: str, challenge: str) -> dict:
+    payload = urllib.parse.urlencode({
+        "client_id": CLIENT_ID,
+        "scope": SCOPE,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }).encode()
+    req = urllib.request.Request(
+        DEVICE_CODE_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def poll_for_token(device_code: str, verifier: str) -> dict | None:
+    payload = urllib.parse.urlencode({
+        "client_id": CLIENT_ID,
+        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        "device_code": device_code,
+        "code_verifier": verifier,
+    }).encode()
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = json.loads(e.read())
+        error = body.get("error", "")
+        if error in ("authorization_pending", "slow_down"):
+            return None
+        raise
+
+
+def write_qwen_creds(tokens: dict):
+    QWEN_CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    creds = {
+        "access_token": tokens.get("access_token", ""),
+        "token_type": tokens.get("token_type", "Bearer"),
+        "refresh_token": tokens.get("refresh_token", ""),
+        "resource_url": "portal.qwen.ai",
+        "expiry_date": tokens.get("expires_in", 0) * 1000 + int(time.time() * 1000),
+    }
+    QWEN_CREDS_FILE.write_text(json.dumps(creds, indent=2))
+    QWEN_CREDS_FILE.chmod(0o600)
+
+
+def add_to_accounts_store(name: str, tokens: dict):
+    import uuid
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    expiry = tokens.get("expires_in", 0) * 1000 + int(time.time() * 1000)
+    entry = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "tool": "qwen",
+        "email": tokens.get("email", ""),
+        "plan_type": "",
+        "auth_mode": "qwen_oauth",
+        "auth_data": {
+            "type": "qwen_oauth",
+            "access_token": tokens.get("access_token", ""),
+            "token_type": tokens.get("token_type", "Bearer"),
+            "refresh_token": tokens.get("refresh_token", ""),
+            "resource_url": "portal.qwen.ai",
+            "expiry_date": expiry,
+        },
+        "created_at": now,
+        "last_used_at": now,
+    }
+    if ACCOUNTS_FILE.exists():
+        store = json.loads(ACCOUNTS_FILE.read_text())
+    else:
+        ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        store = {"version": 1, "accounts": [], "active_account_id": None, "masked_account_ids": []}
+    store["accounts"].append(entry)
+    ACCOUNTS_FILE.write_text(json.dumps(store, indent=2))
+
+
+def run_background_poller(name: str, device_code: str, verifier: str):
+    deadline = time.time() + POLL_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(POLL_INTERVAL)
+        try:
+            tokens = poll_for_token(device_code, verifier)
+            if tokens:
+                write_qwen_creds(tokens)
+                add_to_accounts_store(name, tokens)
+                write_status(name, {"status": "done", "name": name})
+                return
+        except Exception as e:
+            write_status(name, {"status": "error", "msg": str(e)})
+            return
+    write_status(name, {"status": "error", "msg": "Timed out waiting for authorization (10 min)"})
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: qwen-login <account-name>")
+        sys.exit(1)
+
+    name = sys.argv[1].strip()
+    if not name:
+        print("Error: account name cannot be empty")
+        sys.exit(1)
+
+    verifier, challenge = pkce_pair()
+
+    try:
+        resp = request_device_code(verifier, challenge)
+    except Exception as e:
+        print(f"Error starting Qwen login: {e}")
+        sys.exit(1)
+
+    device_code = resp.get("device_code")
+    verify_url = resp.get("verification_uri_complete") or resp.get("verification_uri")
+
+    if not device_code or not verify_url:
+        print(f"Error: unexpected response from Qwen: {resp}")
+        sys.exit(1)
+
+    write_status(name, {"status": "pending", "url": verify_url})
+
+    # Fork background poller
+    subprocess.Popen(
+        [sys.executable, __file__, "--background", name, device_code, verifier],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    print(f"Open this URL to authorize Qwen:\n\n{verify_url}\n\nThen run /login-status {name} to confirm.")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 5 and sys.argv[1] == "--background":
+        _, _, name, device_code, verifier = sys.argv[:5]
+        run_background_poller(name, device_code, verifier)
+    else:
+        main()

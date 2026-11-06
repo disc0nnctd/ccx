@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""
+login-status <account-name>
+
+Checks the status of an in-progress login started by codex-login or qwen-login.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+STATUS_DIR = Path.home() / ".ccx-login"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: login-status <account-name>")
+        sys.exit(1)
+
+    name = sys.argv[1].strip()
+    status_file = STATUS_DIR / f"{name}.status"
+
+    if not status_file.exists():
+        print(f"No login in progress for '{name}'.")
+        print("Start one with /account add <name> (Codex) or /login-qwen <name> (Qwen).")
+        sys.exit(0)
+
+    try:
+        data = json.loads(status_file.read_text())
+    except Exception as e:
+        print(f"Error reading status file: {e}")
+        sys.exit(1)
+
+    status = data.get("status", "unknown")
+
+    if status == "pending":
+        url = data.get("url", "")
+        print(f"Still waiting for authorization...")
+        if url:
+            print(f"URL: {url}")
+    elif status == "done":
+        account_name = data.get("name", name)
+        email = data.get("email", "")
+        print(f"Logged in successfully as '{account_name}'!" + (f" ({email})" if email else ""))
+        print("Run /account to see all accounts.")
+        # Clean up status file after successful read
+        status_file.unlink(missing_ok=True)
+    elif status == "error":
+        msg = data.get("msg", "unknown error")
+        print(f"Login failed: {msg}")
+        # Clean up on error too
+        status_file.unlink(missing_ok=True)
+    else:
+        print(f"Unknown status: {status}")
+
+
+if __name__ == "__main__":
+    main()

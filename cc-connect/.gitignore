@@ -1,0 +1,14 @@
+/cc-connect
+config.toml
+.cc-connect/
+*.exe
+*.dll
+*.so
+*.dylib
+.env
+.DS_Store
+dist
+test
+RELEASE.md
+.npmrc
+scripts

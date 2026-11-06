@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""usage-all — show usage for all Codex accounts via codex-lb"""
+
+import json
+import sys
+import os
+import urllib.request
+import urllib.error
+import urllib.parse
+import http.cookiejar
+from datetime import datetime, timezone
+
+BASE_URL = "http://127.0.0.1:2455"
+API_KEY = os.environ.get("CODEX_LB_API_KEY", "codex-lb-local")
+DASHBOARD_PASSWORD = os.environ.get("CODEX_LB_DASHBOARD_PASSWORD")
+
+STATUS_ICONS = {
+    "active": "●",
+    "rate_limited": "⏳",
+    "quota_exceeded": "⛔",
+    "paused": "⏸",
+    "deactivated": "✗",
+}
+
+
+def api_get(path):
+    try:
+        req = urllib.request.Request(f"{BASE_URL}{path}", headers={"Authorization": f"Bearer {API_KEY}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401 and DASHBOARD_PASSWORD:
+            return api_get_with_dashboard_session(path)
+        print(f"Error: HTTP {e.code}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error connecting to codex-lb at {BASE_URL}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def api_get_with_dashboard_session(path):
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    payload = json.dumps({"password": DASHBOARD_PASSWORD}).encode("utf-8")
+    login_req = urllib.request.Request(
+        f"{BASE_URL}/api/dashboard-auth/password/login",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener.open(login_req, timeout=10).read()
+    data_req = urllib.request.Request(f"{BASE_URL}{path}")
+    with opener.open(data_req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def bar(pct_remaining):
+    used = 100 - pct_remaining
+    filled = round(used / 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def reset_str(reset_at_iso):
+    if not reset_at_iso:
+        return ""
+    try:
+        reset_dt = datetime.fromisoformat(reset_at_iso.replace("Z", "+00:00"))
+        secs = int((reset_dt - datetime.now(timezone.utc)).total_seconds())
+        if secs <= 0:
+            return "resetting soon"
+        days, rem = divmod(secs, 86400)
+        hours = rem // 3600
+        if days > 0:
+            return f"resets in {days}d {hours}h"
+        mins = rem % 3600 // 60
+        return f"resets in {hours}h {mins}m"
+    except Exception:
+        return ""
+
+
+def fmt_account(a):
+    icon = STATUS_ICONS.get((a.get("status") or "").lower(), "?")
+    email = a.get("email") or a.get("displayName") or "unknown"
+    plan = a.get("planType") or "?"
+    usage = a.get("usage") or {}
+
+    lines = [f"{icon} {email} [{plan}]"]
+
+    sec_rem = usage.get("secondaryRemainingPercent")
+    if sec_rem is not None and a.get("windowMinutesSecondary"):
+        used_pct = 100 - sec_rem
+        rst = reset_str(a.get("resetAtSecondary"))
+        rst_part = f"  {rst}" if rst else ""
+        warn = "  !" if used_pct >= 90 else ""
+        lines.append(f"  secondary: {bar(sec_rem)} {used_pct:5.1f}% used{rst_part}{warn}")
+
+    cap = a.get("capacityCreditsSecondary")
+    rem = a.get("remainingCreditsSecondary")
+    if cap and rem is not None:
+        lines.append(f"  credits:   {rem:.1f} / {cap:.1f} remaining")
+
+    req = a.get("requestUsage")
+    if req:
+        count = req.get("requestCount", 0)
+        tokens = req.get("totalTokens", 0)
+        cost = req.get("totalCostUsd", 0)
+        lines.append(f"  requests:  {count} reqs  {tokens/1e6:.1f}M tokens  ${cost:.2f}")
+
+    return "\n".join(lines)
+
+
+def main():
+    data = api_get("/api/accounts")
+    accounts = data.get("accounts", [])
+    if not accounts:
+        print("No accounts registered in codex-lb.")
+        print(f"Add accounts at {BASE_URL}")
+        return
+
+    # Sort: active first, then by secondary remaining (most available first)
+    def sort_key(a):
+        status_order = {"active": 0, "rate_limited": 1, "paused": 2, "quota_exceeded": 3, "deactivated": 4}
+        s = status_order.get((a.get("status") or "").lower(), 9)
+        rem = (a.get("usage") or {}).get("secondaryRemainingPercent", 0)
+        return (s, -rem)
+
+    accounts = sorted(accounts, key=sort_key)
+    print("\n".join(fmt_account(a) for a in accounts))
+
+
+if __name__ == "__main__":
+    main()

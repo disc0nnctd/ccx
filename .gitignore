@@ -1,0 +1,30 @@
+# Build artifacts
+bin/
+dist/
+*.o
+*.a
+*.so
+
+# Go
+go.sum
+vendor/
+
+# Rust/Tauri
+target/
+node_modules/
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+*.tmp
+*.log
+config.toml

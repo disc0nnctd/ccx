@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""
+lb-accounts — show accounts registered in codex-lb.
+Usage:
+  lb-accounts             list all accounts with status
+  lb-accounts pause <id>  pause an account
+  lb-accounts resume <id> reactivate an account
+"""
+
+import json
+import sys
+import urllib.request
+import urllib.error
+
+BASE_URL = "http://127.0.0.1:2455"
+
+STATUS_ICONS = {
+    "active": "●",
+    "rate_limited": "⏳",
+    "quota_exceeded": "⛔",
+    "paused": "⏸",
+    "deactivated": "✗",
+}
+
+
+def api(method: str, path: str) -> dict:
+    req = urllib.request.Request(f"{BASE_URL}{path}", method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"Error: HTTP {e.code} - {e.read().decode()[:200]}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as ex:
+        print(f"Error: {ex}", file=sys.stderr)
+        sys.exit(1)
+
+
+def list_accounts():
+    data = api("GET", "/api/accounts")
+    accounts = data.get("accounts", [])
+    if not accounts:
+        print("No accounts registered in codex-lb.")
+        print("Add accounts at http://localhost:2455")
+        return
+
+    print(f"{'':2} {'email':<38} {'plan':<6} status")
+    print("-" * 70)
+    for a in accounts:
+        icon = STATUS_ICONS.get(a.get("status", "").lower(), "?")
+        email = a.get("email") or "unknown"
+        plan = a.get("plan_type") or "?"
+        status = a.get("status") or "unknown"
+        acct_id = a.get("accountId", "")[:8]
+        usage = a.get("usage") or {}
+        remain = usage.get("primaryRemainingPercent")
+        usage_str = f"  {100-remain:.0f}% used" if remain is not None else ""
+        print(f"{icon}  {email:<38} [{plan:<4}] {status}{usage_str}  ({acct_id})")
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] == "list":
+        list_accounts()
+    elif args[0] == "pause" and len(args) >= 2:
+        acct_id = args[1]
+        api("POST", f"/api/accounts/{acct_id}/pause")
+        print(f"Paused account {acct_id}")
+    elif args[0] == "reactivate" and len(args) >= 2:
+        acct_id = args[1]
+        api("POST", f"/api/accounts/{acct_id}/reactivate")
+        print(f"Reactivated account {acct_id}")
+    else:
+        print(__doc__)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
